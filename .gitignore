@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+*.pyo
+.env
+service_account.json
+token.json
+credentials.json
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
