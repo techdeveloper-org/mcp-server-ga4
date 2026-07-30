@@ -20,11 +20,17 @@ from google.analytics.data_v1beta.types import (
 )
 from google.oauth2 import service_account
 
-from mcp.server.fastmcp import FastMCP
+# mcp 2.0 renamed FastMCP to MCPServer and moved it to mcp.server.mcpserver.
+# Both names are probed so this server runs under either major version; the
+# API used below (tool decorator, run(transport=...)) is identical in both.
+try:
+    from mcp.server.mcpserver import MCPServer
+except ImportError:  # mcp < 2.0
+    from mcp.server.fastmcp import FastMCP as MCPServer
 
 logging.getLogger("googleapiclient.discovery_cache").setLevel(logging.ERROR)
 
-mcp = FastMCP("ga4-server")
+mcp = MCPServer("ga4-server")
 
 PROPERTY_ID = os.environ.get("GA4_PROPERTY_ID", "")
 CREDENTIALS_PATH = os.environ.get(
