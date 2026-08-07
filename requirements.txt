@@ -1,3 +1,4 @@
 google-analytics-data>=0.18.0
+google-api-core>=2.11.0
 google-auth>=2.0.0
-mcp>=1.0.0
+mcp>=1.6.0
