@@ -4,6 +4,7 @@ Provides GA4 reporting tools via the Google Analytics Data API v1.
 Authentication: service account JSON (GOOGLE_APPLICATION_CREDENTIALS env var).
 """
 
+import functools
 import os
 import json
 import logging
@@ -51,6 +52,99 @@ _READ_REMOTE = ToolAnnotations(
     idempotentHint=True,
     openWorldHint=True,
 )
+
+try:
+    from rate_limiter import check_rate_limit
+    _RATE_LIMITER_AVAILABLE = True
+except ImportError:
+    _RATE_LIMITER_AVAILABLE = False
+
+    def check_rate_limit(client_id="default", bucket="tool_calls"):
+        """Fallback used when ``rate_limiter`` cannot be imported.
+
+        Always reports the call as allowed, so a missing vendored module
+        fails open rather than crashing every tool call.
+
+        Args:
+            client_id: Identifier for the caller. Unused in the fallback.
+            bucket: Name of the rate limit bucket. Unused in the fallback.
+
+        Returns:
+            dict with ``allowed`` always ``True``.
+        """
+        return {"allowed": True}
+
+_RATE_LIMIT_UNAVAILABLE_WARNED = threading.Event()
+
+
+def _rate_limit_verdict(bucket: str) -> dict:
+    """Consume one token from ``bucket`` and report whether a call may run.
+
+    Enforcement is opt-in through ``ENABLE_RATE_LIMITING``: with it unset,
+    ``check_rate_limit`` returns allowed without creating any bucket state,
+    so this costs one environment lookup and nothing else. If limiting is
+    switched on but ``rate_limiter`` could not be imported, this warns once
+    on stderr rather than failing open silently -- an operator who set the
+    variable is entitled to know it is doing nothing.
+
+    Args:
+        bucket: Name of the token bucket to draw from.
+
+    Returns:
+        The limiter verdict dict, always containing ``allowed``.
+    """
+    if not _RATE_LIMITER_AVAILABLE:
+        if (os.environ.get("ENABLE_RATE_LIMITING") == "1"
+                and not _RATE_LIMIT_UNAVAILABLE_WARNED.is_set()):
+            _RATE_LIMIT_UNAVAILABLE_WARNED.set()
+            _LOGGER.warning(
+                "rate_limiting_enabled_but_limiter_unavailable",
+                extra={"detail": "ENABLE_RATE_LIMITING=1 has no effect; "
+                                  "rate_limiter is not importable"},
+            )
+        return {"allowed": True}
+    return check_rate_limit(bucket=bucket)
+
+
+def rate_limited(bucket: str):
+    """Decorator that gates a sync MCP tool behind the token-bucket limiter.
+
+    Applied directly below ``@mcp.tool(...)`` so FastMCP's signature
+    introspection (which follows ``__wrapped__`` via ``functools.wraps``)
+    still sees the original tool's parameters for schema generation. A
+    denied call returns a structured JSON string describing the denial
+    without ever invoking the wrapped tool body, so a throttled call never
+    reaches the Google Analytics Data API the bucket protects. Tools that
+    should not draw from any budget -- thin wrappers that delegate their
+    entire body to another already-gated tool -- simply omit this decorator
+    rather than passing a bucket of ``None``.
+
+    Args:
+        bucket: Name of the token bucket this tool draws from.
+
+    Returns:
+        The decorated tool function.
+    """
+    def decorator(fn):
+        @functools.wraps(fn)
+        def wrapper(*args, **kwargs) -> str:
+            """Rate-limit gate wrapping the original sync tool function."""
+            verdict = _rate_limit_verdict(bucket)
+            if not verdict.get("allowed", True):
+                return json.dumps({
+                    "success": False,
+                    "error": (
+                        f"Rate limit exceeded for bucket '{bucket}'. "
+                        f"Retry in {verdict.get('retry_after')} seconds."
+                    ),
+                    "error_type": "RateLimitExceeded",
+                    "bucket": bucket,
+                    "retry_after": verdict.get("retry_after"),
+                })
+            return fn(*args, **kwargs)
+        return wrapper
+    return decorator
+
 
 PROPERTY_ID = os.environ.get("GA4_PROPERTY_ID", "")
 CREDENTIALS_PATH = os.environ.get(
@@ -241,6 +335,7 @@ def _validate_limit(limit: int) -> int:
 
 
 @mcp.tool(annotations=_READ_REMOTE)
+@rate_limited("tool_calls")
 def get_ga4_report(
     dimensions: str,
     metrics: str,
@@ -311,6 +406,11 @@ def get_ga4_report(
     )
 
 
+# Not rate-limited here: the body below returns get_ga4_report(...) directly
+# and does not call the Data API itself, so get_ga4_report's own gate is what
+# protects the quota. Gating this wrapper too would consume two tokens for
+# one logical operation and, on denial, report the wrong tool name back to
+# the caller.
 @mcp.tool(annotations=_READ_REMOTE)
 def get_top_pages(
     start_date: str = "30daysAgo",
@@ -340,6 +440,8 @@ def get_top_pages(
     )
 
 
+# Not rate-limited: delegates entirely to get_ga4_report(...), same reasoning
+# as get_top_pages above.
 @mcp.tool(annotations=_READ_REMOTE)
 def get_traffic_sources(
     start_date: str = "30daysAgo",
@@ -369,6 +471,8 @@ def get_traffic_sources(
     )
 
 
+# Not rate-limited: delegates entirely to get_ga4_report(...), same reasoning
+# as get_top_pages above.
 @mcp.tool(annotations=_READ_REMOTE)
 def get_user_metrics(
     start_date: str = "30daysAgo",
@@ -402,6 +506,7 @@ def get_user_metrics(
 
 
 @mcp.tool(annotations=_READ_REMOTE)
+@rate_limited("tool_calls")
 def get_realtime_users(
     property_id: Optional[str] = None,
     limit: int = 10,
@@ -464,6 +569,8 @@ def get_realtime_users(
     )
 
 
+# Not rate-limited: delegates entirely to get_ga4_report(...), same reasoning
+# as get_top_pages above.
 @mcp.tool(annotations=_READ_REMOTE)
 def get_conversion_events(
     start_date: str = "30daysAgo",
