@@ -152,21 +152,48 @@ CREDENTIALS_PATH = os.environ.get(
     os.path.join(os.path.dirname(__file__), "service_account.json"),
 )
 
+# Domain -> property-ID mappings live in a local JSON file rather than only an
+# env var, and that file is re-read on every call instead of once at process
+# startup. An MCP host typically caches a server's configured env at the time
+# it first launches the subprocess and does not re-inject edits into an
+# already-running process, so an env-var-only mapping would need the whole
+# host restarted to pick up a config change. Re-reading a small local file per
+# call costs a stat + parse, negligible next to the network round trip every
+# tool here makes to the GA4 Data API.
+_PROPERTY_CONFIG_FILE = os.environ.get(
+    "GA4_PROPERTY_CONFIG_FILE",
+    os.path.join(os.path.dirname(__file__), "properties.local.json"),
+)
 
-def _load_property_map() -> dict:
-    """Parse GA4_PROPERTY_MAP into a domain -> numeric-property-id lookup.
 
-    The env var holds a JSON object, e.g. '{"example.com": "123456789"}'.
-    Keys are normalized (lowercased, stripped of a leading "www.") so callers
-    can pass a bare domain in any of its common written forms. A missing or
-    malformed env var yields an empty map rather than raising, since the
-    numeric-ID path (GA4_PROPERTY_ID / explicit property_id) must keep
-    working even when no map has been configured.
+def _normalize_domain(domain: str) -> str:
+    """Lowercase a domain and strip a leading "www." for map lookups.
+
+    Args:
+        domain: Domain string as written by a caller or config file.
+
+    Returns:
+        Normalized domain suitable as a PROPERTY_MAP key.
+    """
+    d = domain.strip().lower()
+    return d[4:] if d.startswith("www.") else d
+
+
+def _parse_property_map_json(raw: str, source: str) -> dict:
+    """Parse a JSON object of domain -> numeric property ID, normalizing keys.
+
+    Shared between the env var and config file loaders so both apply the same
+    validation and normalization. A malformed source yields an empty map
+    rather than raising, since the numeric-ID path (property_id passed
+    directly, or the default) must keep working even when no map is usable.
+
+    Args:
+        raw: JSON object text, e.g. '{"example.com": "123456789"}'.
+        source: Human-readable origin of ``raw``, used in warning logs.
 
     Returns:
         Dict from normalized domain to numeric property ID string.
     """
-    raw = os.environ.get("GA4_PROPERTY_MAP", "")
     if not raw.strip():
         return {}
     try:
@@ -174,24 +201,70 @@ def _load_property_map() -> dict:
     except json.JSONDecodeError:
         _LOGGER.warning(
             "ga4_property_map_invalid_json",
-            extra={"detail": "GA4_PROPERTY_MAP is not valid JSON; ignoring it"},
+            extra={"detail": f"{source} is not valid JSON; ignoring it"},
         )
         return {}
     if not isinstance(parsed, dict):
         _LOGGER.warning(
             "ga4_property_map_not_object",
-            extra={"detail": "GA4_PROPERTY_MAP must be a JSON object; ignoring it"},
+            extra={"detail": f"{source} must be a JSON object; ignoring it"},
         )
         return {}
-
-    def _normalize_domain(domain: str) -> str:
-        d = domain.strip().lower()
-        return d[4:] if d.startswith("www.") else d
-
     return {_normalize_domain(k): str(v).strip() for k, v in parsed.items()}
 
 
-PROPERTY_MAP = _load_property_map()
+def _load_property_config() -> tuple:
+    """Load the current domain -> property-ID map and default property ID.
+
+    Reads fresh on every call, checked in this order:
+
+    1. ``GA4_PROPERTY_CONFIG_FILE`` (default: ``properties.local.json`` next
+       to this script) -- a JSON object with optional ``"default"`` (numeric
+       property ID) and ``"properties"`` (domain -> numeric property ID)
+       keys. Meant to hold real per-deployment values and kept out of version
+       control (see .gitignore) since it is never meant to be committed.
+    2. ``GA4_PROPERTY_MAP`` / ``GA4_PROPERTY_ID`` env vars, used only for
+       whatever the file did not supply -- this keeps existing env-var-only
+       deployments working unchanged.
+
+    Returns:
+        Tuple of (property_map: dict, default_property_id: str).
+    """
+    property_map: dict = {}
+    default_id = PROPERTY_ID
+
+    if os.path.exists(_PROPERTY_CONFIG_FILE):
+        try:
+            with open(_PROPERTY_CONFIG_FILE, "r", encoding="utf-8") as f:
+                file_data = json.load(f)
+            if isinstance(file_data, dict):
+                file_properties = file_data.get("properties", {})
+                if isinstance(file_properties, dict):
+                    property_map.update(
+                        {
+                            _normalize_domain(k): str(v).strip()
+                            for k, v in file_properties.items()
+                        }
+                    )
+                file_default = file_data.get("default")
+                if file_default:
+                    default_id = str(file_default).strip()
+            else:
+                _LOGGER.warning(
+                    "ga4_property_config_file_not_object",
+                    extra={"detail": f"{_PROPERTY_CONFIG_FILE} must contain a JSON object; ignoring it"},
+                )
+        except (OSError, json.JSONDecodeError) as exc:
+            _LOGGER.warning(
+                "ga4_property_config_file_unreadable",
+                extra={"detail": f"{_PROPERTY_CONFIG_FILE}: {exc}; falling back to env vars"},
+            )
+
+    env_map = _parse_property_map_json(os.environ.get("GA4_PROPERTY_MAP", ""), "GA4_PROPERTY_MAP")
+    for domain, pid in env_map.items():
+        property_map.setdefault(domain, pid)
+
+    return property_map, default_id
 
 # GA4 Data API row-limit bounds (runReport accepts 1..250000).
 _MIN_LIMIT = 1
@@ -301,19 +374,21 @@ def _call_with_retry(operation: Callable[[], Any], operation_name: str) -> Any:
 
 
 def _resolve_property(property_id: Optional[str]) -> str:
-    """Resolve a property ID or site domain, falling back to env var.
+    """Resolve a property ID or site domain, falling back to the configured default.
 
     Accepts three forms for ``property_id``: a bare numeric ID
     (``"123456789"``), a fully-qualified resource name
-    (``"properties/123456789"``), or a domain registered in
-    ``GA4_PROPERTY_MAP`` (``"example.com"``, ``"www.example.com"``). Domain
-    lookup is tried first since digits-only is unambiguous but a domain
-    string is not itself a valid property ID, so there is no case where the
-    two forms collide.
+    (``"properties/123456789"``), or a domain registered via
+    ``GA4_PROPERTY_CONFIG_FILE`` or ``GA4_PROPERTY_MAP`` (``"example.com"``,
+    ``"www.example.com"``). Domain lookup is tried first since digits-only is
+    unambiguous but a domain string is not itself a valid property ID, so
+    there is no case where the two forms collide. The config file and env var
+    are both re-read on every call (see _load_property_config), so an edit to
+    the file takes effect on the very next tool call with no server restart.
 
     Args:
-        property_id: Explicit GA4 property ID or domain, or None to use
-            GA4_PROPERTY_ID.
+        property_id: Explicit GA4 property ID or domain, or None to use the
+            configured default.
 
     Returns:
         Fully-qualified resource name in the form ``properties/<id>``.
@@ -323,56 +398,59 @@ def _resolve_property(property_id: Optional[str]) -> str:
             neither a known domain nor a bare numeric ID (optionally already
             prefixed with ``properties/``).
     """
-    pid = (property_id or PROPERTY_ID).strip()
+    property_map, default_id = _load_property_config()
+    pid = (property_id or default_id).strip()
     if not pid:
-        available = ", ".join(sorted(PROPERTY_MAP)) or "none configured"
+        available = ", ".join(sorted(property_map)) or "none configured"
         raise ValueError(
             "GA4 property ID required. Pass property_id (numeric ID or a "
-            f"domain from GA4_PROPERTY_MAP: {available}), or set "
-            "GA4_PROPERTY_ID env var."
+            f"domain from list_properties: {available}), or configure a "
+            "default in GA4_PROPERTY_CONFIG_FILE or GA4_PROPERTY_ID."
         )
 
     domain_key = pid.lower()
     if domain_key.startswith("www."):
         domain_key = domain_key[4:]
-    if domain_key in PROPERTY_MAP:
-        bare = PROPERTY_MAP[domain_key]
+    if domain_key in property_map:
+        bare = property_map[domain_key]
     else:
         bare = pid[len("properties/"):] if pid.startswith("properties/") else pid
 
     if not bare.isdigit():
-        available = ", ".join(sorted(PROPERTY_MAP)) or "none configured"
+        available = ", ".join(sorted(property_map)) or "none configured"
         raise ValueError(
             f"Invalid GA4 property ID or domain {pid!r}. Expected a numeric "
             "property ID (e.g. '123456789' or 'properties/123456789') or one "
-            f"of the domains in GA4_PROPERTY_MAP: {available}."
+            f"of the domains from list_properties: {available}."
         )
     return f"properties/{bare}"
 
 
 @mcp.tool(annotations=_READ_REMOTE)
 def list_properties() -> str:
-    """List the GA4 properties registered in GA4_PROPERTY_MAP, plus the default.
+    """List the configured GA4 properties, plus the default.
 
     Call this first when working with a site whose property ID you don't
     already know, or when unsure which property a bare property_id argument
-    would resolve to. The map is configured once in the server's environment
-    (GA4_PROPERTY_MAP as a JSON object of domain -> numeric property ID) --
-    this tool only reports what's there, it does not query the Analytics
-    Admin API, so an unregistered property must still be added to the env var
-    to be resolvable by domain name.
+    would resolve to. Reads GA4_PROPERTY_CONFIG_FILE (default:
+    properties.local.json next to the server) and the GA4_PROPERTY_MAP /
+    GA4_PROPERTY_ID env vars fresh on every call -- this tool only reports
+    what's currently configured there, it does not query the Analytics Admin
+    API, so an unregistered property must still be added to the config file
+    or env var to be resolvable by domain name.
 
     Returns:
         JSON string with ``properties`` (list of {domain, property_id}) and
-        ``default_property_id`` (from GA4_PROPERTY_ID, or null if unset).
+        ``default_property_id`` (or null if none configured).
     """
+    property_map, default_id = _load_property_config()
     return json.dumps(
         {
             "properties": [
                 {"domain": domain, "property_id": pid}
-                for domain, pid in sorted(PROPERTY_MAP.items())
+                for domain, pid in sorted(property_map.items())
             ],
-            "default_property_id": PROPERTY_ID or None,
+            "default_property_id": default_id or None,
         },
         indent=2,
     )

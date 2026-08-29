@@ -1,0 +1,7 @@
+{
+  "default": "123456789",
+  "properties": {
+    "example.com": "123456789",
+    "another-site.com": "987654321"
+  }
+}
