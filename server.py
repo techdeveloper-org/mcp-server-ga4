@@ -152,6 +152,47 @@ CREDENTIALS_PATH = os.environ.get(
     os.path.join(os.path.dirname(__file__), "service_account.json"),
 )
 
+
+def _load_property_map() -> dict:
+    """Parse GA4_PROPERTY_MAP into a domain -> numeric-property-id lookup.
+
+    The env var holds a JSON object, e.g. '{"example.com": "123456789"}'.
+    Keys are normalized (lowercased, stripped of a leading "www.") so callers
+    can pass a bare domain in any of its common written forms. A missing or
+    malformed env var yields an empty map rather than raising, since the
+    numeric-ID path (GA4_PROPERTY_ID / explicit property_id) must keep
+    working even when no map has been configured.
+
+    Returns:
+        Dict from normalized domain to numeric property ID string.
+    """
+    raw = os.environ.get("GA4_PROPERTY_MAP", "")
+    if not raw.strip():
+        return {}
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError:
+        _LOGGER.warning(
+            "ga4_property_map_invalid_json",
+            extra={"detail": "GA4_PROPERTY_MAP is not valid JSON; ignoring it"},
+        )
+        return {}
+    if not isinstance(parsed, dict):
+        _LOGGER.warning(
+            "ga4_property_map_not_object",
+            extra={"detail": "GA4_PROPERTY_MAP must be a JSON object; ignoring it"},
+        )
+        return {}
+
+    def _normalize_domain(domain: str) -> str:
+        d = domain.strip().lower()
+        return d[4:] if d.startswith("www.") else d
+
+    return {_normalize_domain(k): str(v).strip() for k, v in parsed.items()}
+
+
+PROPERTY_MAP = _load_property_map()
+
 # GA4 Data API row-limit bounds (runReport accepts 1..250000).
 _MIN_LIMIT = 1
 _MAX_LIMIT = 250000
@@ -260,31 +301,81 @@ def _call_with_retry(operation: Callable[[], Any], operation_name: str) -> Any:
 
 
 def _resolve_property(property_id: Optional[str]) -> str:
-    """Resolve property ID, falling back to env var.
+    """Resolve a property ID or site domain, falling back to env var.
+
+    Accepts three forms for ``property_id``: a bare numeric ID
+    (``"123456789"``), a fully-qualified resource name
+    (``"properties/123456789"``), or a domain registered in
+    ``GA4_PROPERTY_MAP`` (``"example.com"``, ``"www.example.com"``). Domain
+    lookup is tried first since digits-only is unambiguous but a domain
+    string is not itself a valid property ID, so there is no case where the
+    two forms collide.
 
     Args:
-        property_id: Explicit GA4 property ID, or None to use GA4_PROPERTY_ID.
+        property_id: Explicit GA4 property ID or domain, or None to use
+            GA4_PROPERTY_ID.
 
     Returns:
         Fully-qualified resource name in the form ``properties/<id>``.
 
     Raises:
-        ValueError: If no property ID is available, or the resolved ID is not a
-            bare numeric ID (optionally already prefixed with ``properties/``).
+        ValueError: If no property ID is available, or the resolved value is
+            neither a known domain nor a bare numeric ID (optionally already
+            prefixed with ``properties/``).
     """
     pid = (property_id or PROPERTY_ID).strip()
     if not pid:
+        available = ", ".join(sorted(PROPERTY_MAP)) or "none configured"
         raise ValueError(
-            "GA4 property ID required. Pass property_id or set GA4_PROPERTY_ID env var."
+            "GA4 property ID required. Pass property_id (numeric ID or a "
+            f"domain from GA4_PROPERTY_MAP: {available}), or set "
+            "GA4_PROPERTY_ID env var."
         )
 
-    bare = pid[len("properties/"):] if pid.startswith("properties/") else pid
+    domain_key = pid.lower()
+    if domain_key.startswith("www."):
+        domain_key = domain_key[4:]
+    if domain_key in PROPERTY_MAP:
+        bare = PROPERTY_MAP[domain_key]
+    else:
+        bare = pid[len("properties/"):] if pid.startswith("properties/") else pid
+
     if not bare.isdigit():
+        available = ", ".join(sorted(PROPERTY_MAP)) or "none configured"
         raise ValueError(
-            f"Invalid GA4 property ID {pid!r}. Expected the numeric property ID "
-            "(e.g. '123456789' or 'properties/123456789')."
+            f"Invalid GA4 property ID or domain {pid!r}. Expected a numeric "
+            "property ID (e.g. '123456789' or 'properties/123456789') or one "
+            f"of the domains in GA4_PROPERTY_MAP: {available}."
         )
     return f"properties/{bare}"
+
+
+@mcp.tool(annotations=_READ_REMOTE)
+def list_properties() -> str:
+    """List the GA4 properties registered in GA4_PROPERTY_MAP, plus the default.
+
+    Call this first when working with a site whose property ID you don't
+    already know, or when unsure which property a bare property_id argument
+    would resolve to. The map is configured once in the server's environment
+    (GA4_PROPERTY_MAP as a JSON object of domain -> numeric property ID) --
+    this tool only reports what's there, it does not query the Analytics
+    Admin API, so an unregistered property must still be added to the env var
+    to be resolvable by domain name.
+
+    Returns:
+        JSON string with ``properties`` (list of {domain, property_id}) and
+        ``default_property_id`` (from GA4_PROPERTY_ID, or null if unset).
+    """
+    return json.dumps(
+        {
+            "properties": [
+                {"domain": domain, "property_id": pid}
+                for domain, pid in sorted(PROPERTY_MAP.items())
+            ],
+            "default_property_id": PROPERTY_ID or None,
+        },
+        indent=2,
+    )
 
 
 def _parse_api_names(raw: str, field_name: str) -> List[str]:
@@ -357,7 +448,8 @@ def get_ga4_report(
             (e.g. 'sessions,activeUsers'). At least one is required.
         start_date: Inclusive start date, GA4 syntax ('30daysAgo', 'YYYY-MM-DD').
         end_date: Inclusive end date, GA4 syntax ('today', 'YYYY-MM-DD').
-        property_id: Numeric GA4 property ID. Uses GA4_PROPERTY_ID env var if omitted.
+        property_id: Numeric GA4 property ID, or a domain registered in GA4_PROPERTY_MAP
+            (see list_properties). Uses GA4_PROPERTY_ID env var if omitted.
         limit: Max rows to return, 1-250000 (default 10).
 
     Returns:
@@ -423,7 +515,8 @@ def get_top_pages(
     Args:
         start_date: Inclusive start date, GA4 syntax (default '30daysAgo').
         end_date: Inclusive end date, GA4 syntax (default 'today').
-        property_id: Numeric GA4 property ID. Uses GA4_PROPERTY_ID env var if omitted.
+        property_id: Numeric GA4 property ID, or a domain registered in GA4_PROPERTY_MAP
+            (see list_properties). Uses GA4_PROPERTY_ID env var if omitted.
         limit: Max pages to return, 1-250000 (default 10).
 
     Returns:
@@ -454,7 +547,8 @@ def get_traffic_sources(
     Args:
         start_date: Inclusive start date, GA4 syntax (default '30daysAgo').
         end_date: Inclusive end date, GA4 syntax (default 'today').
-        property_id: Numeric GA4 property ID. Uses GA4_PROPERTY_ID env var if omitted.
+        property_id: Numeric GA4 property ID, or a domain registered in GA4_PROPERTY_MAP
+            (see list_properties). Uses GA4_PROPERTY_ID env var if omitted.
         limit: Max rows to return, 1-250000 (default 10).
 
     Returns:
@@ -489,7 +583,8 @@ def get_user_metrics(
     Args:
         start_date: Inclusive start date, GA4 syntax (default '30daysAgo').
         end_date: Inclusive end date, GA4 syntax (default 'today').
-        property_id: Numeric GA4 property ID. Uses GA4_PROPERTY_ID env var if omitted.
+        property_id: Numeric GA4 property ID, or a domain registered in GA4_PROPERTY_MAP
+            (see list_properties). Uses GA4_PROPERTY_ID env var if omitted.
         limit: Max days to return, 1-250000 (default 400, covers just over a year).
 
     Returns:
@@ -519,7 +614,8 @@ def get_realtime_users(
     and a truncated flag, rather than as a property-wide total.
 
     Args:
-        property_id: Numeric GA4 property ID. Uses GA4_PROPERTY_ID env var if omitted.
+        property_id: Numeric GA4 property ID, or a domain registered in GA4_PROPERTY_MAP
+            (see list_properties). Uses GA4_PROPERTY_ID env var if omitted.
         limit: Max breakdown rows to return, 1-250000 (default 10).
 
     Returns:
@@ -583,7 +679,8 @@ def get_conversion_events(
     Args:
         start_date: Inclusive start date, GA4 syntax (default '30daysAgo').
         end_date: Inclusive end date, GA4 syntax (default 'today').
-        property_id: Numeric GA4 property ID. Uses GA4_PROPERTY_ID env var if omitted.
+        property_id: Numeric GA4 property ID, or a domain registered in GA4_PROPERTY_MAP
+            (see list_properties). Uses GA4_PROPERTY_ID env var if omitted.
         limit: Max rows to return, 1-250000 (default 10).
 
     Returns:
