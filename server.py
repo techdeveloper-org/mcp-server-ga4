@@ -14,6 +14,13 @@ import threading
 import time
 from typing import Any, Callable, List, Optional
 
+# v1alpha, not v1beta: AccessBinding management (create_access_binding,
+# list_access_bindings) is only exposed on the v1alpha admin client as of
+# google-analytics-admin 0.30.1 -- v1beta has KeyEvent support but no
+# AccessBinding type or methods at all. v1alpha also has KeyEvent, so one
+# client covers both instead of splitting across two admin client versions.
+from google.analytics.admin_v1alpha import AnalyticsAdminServiceClient
+from google.analytics.admin_v1alpha.types import AccessBinding, KeyEvent
 from google.analytics.data_v1beta import BetaAnalyticsDataClient
 from google.analytics.data_v1beta.types import (
     DateRange,
@@ -48,6 +55,19 @@ mcp = MCPServer("ga4-server")
 # least-safe combination, which would block auto-approval of a pure read.
 _READ_REMOTE = ToolAnnotations(
     readOnlyHint=True,
+    destructiveHint=False,
+    idempotentHint=True,
+    openWorldHint=True,
+)
+
+# Admin API writes below are non-destructive in the sense that they never
+# delete or overwrite existing GA4 configuration: marking a key event only
+# adds a flag (and is a documented no-op if already set -- see
+# mark_key_event), and granting access only adds a new access binding. Both
+# are idempotent for the same inputs, so this shares one annotation vector
+# distinct from _READ_REMOTE only in readOnlyHint.
+_WRITE_REMOTE_SAFE = ToolAnnotations(
+    readOnlyHint=False,
     destructiveHint=False,
     idempotentHint=True,
     openWorldHint=True,
@@ -327,6 +347,54 @@ def _get_client() -> BetaAnalyticsDataClient:
         )
         _client = BetaAnalyticsDataClient(credentials=creds)
         return _client
+
+
+_admin_client = None
+_admin_client_lock = threading.Lock()
+
+
+def _get_admin_client() -> AnalyticsAdminServiceClient:
+    """Return a cached, authenticated GA4 Admin API client.
+
+    Kept separate from _get_client() because the Admin API needs broader
+    scopes (edit + manage.users) than the read-only Data API client above --
+    requesting them together would widen every read tool's token to include
+    write scopes it never uses. The service account itself must additionally
+    hold Editor (for mark_key_event) or Administrator (for
+    grant_property_access / list_access_bindings) role on the target
+    property; holding these OAuth scopes is necessary but not sufficient --
+    a Viewer-role service account will still get PERMISSION_DENIED from
+    Google, surfaced as-is by the tools below rather than pre-checked here.
+
+    Returns:
+        Authenticated AnalyticsAdminServiceClient.
+
+    Raises:
+        FileNotFoundError: If the service account JSON file cannot be found at
+            the configured path.
+    """
+    global _admin_client
+    if _admin_client is not None:
+        return _admin_client
+
+    with _admin_client_lock:
+        if _admin_client is not None:
+            return _admin_client
+        if not os.path.exists(CREDENTIALS_PATH):
+            raise FileNotFoundError(
+                f"Credentials file not found: {CREDENTIALS_PATH}. "
+                "Set the GOOGLE_APPLICATION_CREDENTIALS env var to the absolute "
+                "path of your GA4 service account JSON key."
+            )
+        creds = service_account.Credentials.from_service_account_file(
+            CREDENTIALS_PATH,
+            scopes=[
+                "https://www.googleapis.com/auth/analytics.edit",
+                "https://www.googleapis.com/auth/analytics.manage.users",
+            ],
+        )
+        _admin_client = AnalyticsAdminServiceClient(credentials=creds)
+        return _admin_client
 
 
 def _call_with_retry(operation: Callable[[], Any], operation_name: str) -> Any:
@@ -773,6 +841,171 @@ def get_conversion_events(
         property_id=property_id,
         limit=limit,
     )
+
+
+# GA4 Admin API predefined property roles (accessBindings.roles accepts these
+# resource names, plus a small set of add-on roles not useful for a single
+# grant call). Validated locally so a typo does not silently create a
+# binding with an unintended role.
+_PREDEFINED_ROLES = {
+    "predefinedRoles/viewer",
+    "predefinedRoles/analyst",
+    "predefinedRoles/editor",
+    "predefinedRoles/admin",
+    "predefinedRoles/marketer",
+}
+
+
+@mcp.tool(annotations=_WRITE_REMOTE_SAFE)
+def mark_key_event(event_name: str, property_id: Optional[str] = None) -> str:
+    """Mark a GA4 event as a key event (conversion).
+
+    Requires the configured service account to hold Editor or Administrator
+    role on the target property -- Viewer is not sufficient and this call
+    will fail with PERMISSION_DENIED under Viewer-only access.
+
+    Idempotent: if event_name is already marked as a key event, this returns
+    success with already_marked=true rather than an error, since the caller's
+    intent ("make sure this is a key event") is already satisfied.
+
+    Args:
+        event_name: GA4 event name to mark, e.g. 'generate_lead'.
+        property_id: Numeric GA4 property ID, or a domain registered in
+            GA4_PROPERTY_MAP (see list_properties). Uses GA4_PROPERTY_ID env
+            var if omitted.
+
+    Returns:
+        JSON string with property, event_name, already_marked, and (when
+        newly created) the key event's resource name.
+
+    Raises:
+        ValueError: If property_id is invalid.
+        google.api_core.exceptions.GoogleAPIError: On permission or API
+            errors other than AlreadyExists.
+    """
+    if not event_name or not event_name.strip():
+        raise ValueError("event_name is required.")
+    event_name = event_name.strip()
+
+    client = _get_admin_client()
+    prop = _resolve_property(property_id)
+
+    try:
+        result = client.create_key_event(
+            parent=prop,
+            key_event=KeyEvent(
+                event_name=event_name,
+                counting_method=KeyEvent.CountingMethod.ONCE_PER_EVENT,
+            ),
+        )
+    except google_exceptions.AlreadyExists:
+        return json.dumps({
+            "property": prop,
+            "event_name": event_name,
+            "already_marked": True,
+        }, indent=2)
+
+    return json.dumps({
+        "property": prop,
+        "event_name": event_name,
+        "already_marked": False,
+        "key_event_name": result.name,
+    }, indent=2)
+
+
+@mcp.tool(annotations=_WRITE_REMOTE_SAFE)
+def grant_property_access(
+    user_email: str,
+    role: str = "predefinedRoles/viewer",
+    property_id: Optional[str] = None,
+) -> str:
+    """Grant a Google account access to a GA4 property.
+
+    Requires the configured service account to hold Administrator role on
+    the target property -- this is a higher bar than mark_key_event's Editor
+    requirement, since managing other users' access is itself an admin-only
+    action in GA4. A service account that only has Viewer or Editor access
+    will get PERMISSION_DENIED here even though it can read reports or mark
+    key events fine.
+
+    Idempotent: granting a role the user already holds succeeds without
+    creating a duplicate binding (the Admin API itself de-dupes on
+    user+role).
+
+    Args:
+        user_email: Google account email to grant access to.
+        role: One of predefinedRoles/viewer, predefinedRoles/analyst,
+            predefinedRoles/editor, predefinedRoles/admin,
+            predefinedRoles/marketer. Defaults to viewer (read-only), the
+            least-privilege choice for a reporting integration.
+        property_id: Numeric GA4 property ID, or a domain registered in
+            GA4_PROPERTY_MAP (see list_properties). Uses GA4_PROPERTY_ID env
+            var if omitted.
+
+    Returns:
+        JSON string with property, user_email, role, and the created access
+        binding's resource name.
+
+    Raises:
+        ValueError: If user_email, role, or property_id are invalid.
+        google.api_core.exceptions.GoogleAPIError: On permission or API
+            errors.
+    """
+    if not user_email or "@" not in user_email:
+        raise ValueError(f"user_email must be a valid email address, got {user_email!r}.")
+    if role not in _PREDEFINED_ROLES:
+        raise ValueError(
+            f"Invalid role {role!r}. Expected one of: {sorted(_PREDEFINED_ROLES)}."
+        )
+
+    client = _get_admin_client()
+    prop = _resolve_property(property_id)
+
+    result = client.create_access_binding(
+        parent=prop,
+        access_binding=AccessBinding(user=user_email, roles=[role]),
+    )
+
+    return json.dumps({
+        "property": prop,
+        "user_email": user_email,
+        "role": role,
+        "access_binding_name": result.name,
+    }, indent=2)
+
+
+@mcp.tool(annotations=_READ_REMOTE)
+def list_access_bindings(property_id: Optional[str] = None) -> str:
+    """List Google accounts with access to a GA4 property, and their roles.
+
+    Requires the configured service account to hold at least Editor role on
+    the target property. Use this to verify a grant_property_access call
+    took effect, or to audit who currently has access before granting more.
+
+    Args:
+        property_id: Numeric GA4 property ID, or a domain registered in
+            GA4_PROPERTY_MAP (see list_properties). Uses GA4_PROPERTY_ID env
+            var if omitted.
+
+    Returns:
+        JSON string with property and a list of {user_email, roles}.
+
+    Raises:
+        ValueError: If property_id is invalid.
+        google.api_core.exceptions.GoogleAPIError: On permission or API
+            errors.
+    """
+    client = _get_admin_client()
+    prop = _resolve_property(property_id)
+
+    bindings = client.list_access_bindings(parent=prop)
+    return json.dumps({
+        "property": prop,
+        "bindings": [
+            {"user_email": b.user, "roles": list(b.roles)}
+            for b in bindings
+        ],
+    }, indent=2)
 
 
 if __name__ == "__main__":

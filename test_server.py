@@ -114,6 +114,96 @@ class TestDelegatingWrapperTools(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
+# TestAdminTools
+# ---------------------------------------------------------------------------
+
+class TestAdminTools(unittest.TestCase):
+    """mark_key_event / grant_property_access / list_access_bindings.
+
+    All three go through _get_admin_client(), a separate cached client from
+    the Data API's _get_client(), so each test patches that one specifically.
+    """
+
+    def test_mark_key_event_returns_new_key_event_name(self):
+        # MagicMock(name=...) sets the mock's own repr, not a `.name`
+        # attribute -- that attribute must be assigned after construction.
+        mod = _load_module()
+        client = MagicMock()
+        key_event = MagicMock()
+        key_event.name = "properties/123456789/keyEvents/1"
+        client.create_key_event.return_value = key_event
+        with patch("server._get_admin_client", return_value=client):
+            result = mod.mark_key_event("generate_lead", property_id="123456789")
+        data = json.loads(result)
+        self.assertEqual(data["property"], "properties/123456789")
+        self.assertEqual(data["event_name"], "generate_lead")
+        self.assertFalse(data["already_marked"])
+        self.assertEqual(data["key_event_name"], "properties/123456789/keyEvents/1")
+
+    def test_mark_key_event_already_marked_is_not_an_error(self):
+        """AlreadyExists means the caller's intent is already satisfied."""
+        from google.api_core import exceptions as google_exceptions
+        mod = _load_module()
+        client = MagicMock()
+        client.create_key_event.side_effect = google_exceptions.AlreadyExists("dup")
+        with patch("server._get_admin_client", return_value=client):
+            result = mod.mark_key_event("generate_lead", property_id="123456789")
+        data = json.loads(result)
+        self.assertTrue(data["already_marked"])
+        self.assertNotIn("key_event_name", data)
+
+    def test_mark_key_event_requires_non_empty_event_name(self):
+        mod = _load_module()
+        with patch("server._get_admin_client", return_value=MagicMock()):
+            with self.assertRaises(ValueError):
+                mod.mark_key_event("   ", property_id="123456789")
+
+    def test_grant_property_access_returns_binding_name(self):
+        mod = _load_module()
+        client = MagicMock()
+        binding_result = MagicMock()
+        binding_result.name = "properties/123456789/accessBindings/1"
+        client.create_access_binding.return_value = binding_result
+        with patch("server._get_admin_client", return_value=client):
+            result = mod.grant_property_access(
+                "someone@example.com", property_id="123456789"
+            )
+        data = json.loads(result)
+        self.assertEqual(data["user_email"], "someone@example.com")
+        self.assertEqual(data["role"], "predefinedRoles/viewer")
+        self.assertEqual(data["access_binding_name"], "properties/123456789/accessBindings/1")
+
+    def test_grant_property_access_rejects_invalid_role(self):
+        mod = _load_module()
+        with patch("server._get_admin_client", return_value=MagicMock()):
+            with self.assertRaises(ValueError):
+                mod.grant_property_access(
+                    "someone@example.com", role="predefinedRoles/superadmin",
+                    property_id="123456789",
+                )
+
+    def test_grant_property_access_rejects_malformed_email(self):
+        mod = _load_module()
+        with patch("server._get_admin_client", return_value=MagicMock()):
+            with self.assertRaises(ValueError):
+                mod.grant_property_access("not-an-email", property_id="123456789")
+
+    def test_list_access_bindings_returns_user_and_roles(self):
+        mod = _load_module()
+        client = MagicMock()
+        binding = MagicMock(user="someone@example.com", roles=["predefinedRoles/viewer"])
+        client.list_access_bindings.return_value = [binding]
+        with patch("server._get_admin_client", return_value=client):
+            result = mod.list_access_bindings(property_id="123456789")
+        data = json.loads(result)
+        self.assertEqual(data["property"], "properties/123456789")
+        self.assertEqual(
+            data["bindings"],
+            [{"user_email": "someone@example.com", "roles": ["predefinedRoles/viewer"]}],
+        )
+
+
+# ---------------------------------------------------------------------------
 # TestRateLimiting
 # ---------------------------------------------------------------------------
 

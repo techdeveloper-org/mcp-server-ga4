@@ -1,8 +1,12 @@
 # mcp-server-ga4
 
-Google Analytics 4 MCP Server — provides GA4 reporting tools via the Google Analytics Data API v1beta.
+Google Analytics 4 MCP Server — provides GA4 reporting tools via the Google Analytics Data API
+v1beta, plus a small set of GA4 Admin API (v1alpha) tools for configuration changes that have
+no other API surface (marking key events, managing property access).
 
 ## Tools
+
+### Reporting (Data API, requires Viewer role)
 
 | Tool | Description |
 |------|-------------|
@@ -18,6 +22,29 @@ Every tool above `list_properties` takes an optional `property_id` argument. Pas
 GA4 property ID, a fully-qualified `properties/<id>` resource name, or (if configured, see
 below) a bare domain like `"example.com"`. Omit it to use the configured default.
 
+### Admin (Admin API, requires Editor or Administrator role — see per-tool notes)
+
+| Tool | Description | Service account role required |
+|------|-------------|-------------------------------|
+| `mark_key_event` | Mark a GA4 event as a key event (conversion) | Editor |
+| `grant_property_access` | Grant a Google account access to a property | Administrator |
+| `list_access_bindings` | List who has access to a property, and their roles | Editor |
+
+These exist because neither the GA4 UI action "mark as key event" nor "grant property access"
+has any other API — the Data API this server otherwise uses is read-only by design. Both write
+tools are idempotent: re-marking an already-marked event or re-granting an already-held role
+succeeds without creating a duplicate.
+
+**A Viewer-role service account (the minimum this server otherwise needs) cannot call the Admin
+tools** — Google's own permission model requires Editor for `mark_key_event` and Administrator
+for the other two, regardless of what scopes the service account's credentials request. If a
+call fails with `PERMISSION_DENIED`, raise that property's role for the service account in
+GA4 Admin → Property Access Management, rather than treating it as a bug here.
+
+Also requires the **Google Analytics Admin API** enabled on the same Google Cloud project as
+the service account (separate from the Data API used by the reporting tools above) — enable it
+at `console.cloud.google.com/apis/library/analyticsadmin.googleapis.com`.
+
 ## Setup
 
 ### 1. Install dependencies
@@ -29,12 +56,14 @@ pip install -r requirements.txt
 ### 2. Create a Service Account
 
 1. Go to [Google Cloud Console](https://console.cloud.google.com/)
-2. Enable **Google Analytics Data API**
+2. Enable **Google Analytics Data API** (reporting tools) and, if you plan to use the Admin
+   tools above, **Google Analytics Admin API** too
 3. Create a Service Account → download JSON key
 4. In GA4, for **every** property this server should read: Admin → Property Access Management →
-   add the service account's email with **Viewer** role. A property the service account isn't
-   added to will fail with a permission error even if it's listed in `properties.local.json`
-   below — the file only controls ID *resolution*, not GA4 access.
+   add the service account's email with **Viewer** role (or **Editor**/**Administrator** if you
+   need the Admin tools on that property — see the table above). A property the service account
+   isn't added to will fail with a permission error even if it's listed in
+   `properties.local.json` below — the file only controls ID *resolution*, not GA4 access.
 
 ### 3. Register the server with Claude Code
 
