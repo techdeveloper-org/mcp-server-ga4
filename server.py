@@ -4,6 +4,8 @@ Provides GA4 reporting tools via the Google Analytics Data API v1.
 Authentication: service account JSON (GOOGLE_APPLICATION_CREDENTIALS env var).
 """
 
+from __future__ import annotations
+
 import functools
 import os
 import json
@@ -14,23 +16,14 @@ import threading
 import time
 from typing import Any, Callable, List, Optional
 
-# v1alpha, not v1beta: AccessBinding management (create_access_binding,
-# list_access_bindings) is only exposed on the v1alpha admin client as of
-# google-analytics-admin 0.30.1 -- v1beta has KeyEvent support but no
-# AccessBinding type or methods at all. v1alpha also has KeyEvent, so one
-# client covers both instead of splitting across two admin client versions.
-from google.analytics.admin_v1alpha import AnalyticsAdminServiceClient
-from google.analytics.admin_v1alpha.types import AccessBinding, KeyEvent
-from google.analytics.data_v1beta import BetaAnalyticsDataClient
-from google.analytics.data_v1beta.types import (
-    DateRange,
-    Dimension,
-    Metric,
-    RunReportRequest,
-    RunRealtimeReportRequest,
-)
-from google.api_core import exceptions as google_exceptions
-from google.oauth2 import service_account
+# The google-analytics-admin/-data package imports below are deliberately
+# NOT at module level (see _ensure_google_imports()) -- importing them here
+# measured 30+ seconds on this machine (Windows Defender scanning the large
+# generated-protobuf dependency tree on every fresh process), which exceeds
+# the MCP client's connection timeout and made this server fail to even
+# complete its stdio handshake, let alone register tools. `from __future__
+# import annotations` above makes every type hint in this file a lazy
+# string, so none of the names below need to exist at import time.
 
 # mcp 2.0 renamed FastMCP to MCPServer and moved it to mcp.server.mcpserver.
 # Both names are probed so this server runs under either major version; the
@@ -296,14 +289,6 @@ _MAX_LIMIT = 250000
 _MAX_RETRIES = 3
 _BACKOFF_BASE_SECONDS = 1.0
 _BACKOFF_CAP_SECONDS = 30.0
-_RETRYABLE_EXCEPTIONS = (
-    google_exceptions.TooManyRequests,
-    google_exceptions.ResourceExhausted,
-    google_exceptions.ServiceUnavailable,
-    google_exceptions.DeadlineExceeded,
-    google_exceptions.InternalServerError,
-    google_exceptions.Aborted,
-)
 
 # GA4 dimension/metric API names are alphanumeric with optional underscores and
 # colons (e.g. customEvent:my_event). Validated before the request is built so a
@@ -312,6 +297,66 @@ _API_NAME_RE = re.compile(r"^[A-Za-z0-9_:]{1,128}$")
 
 _client = None
 _client_lock = threading.Lock()
+_admin_client = None
+_admin_client_lock = threading.Lock()
+
+_RETRYABLE_EXCEPTIONS = None
+_google_imports_loaded = False
+_import_lock = threading.Lock()
+
+
+def _ensure_google_imports() -> None:
+    """Import the google-analytics-admin/-data/-oauth packages on first use.
+
+    Not done at module level: the `google` namespace package's first touch
+    in a fresh process measured 20-30+ seconds on this machine regardless of
+    which specific submodule triggered it (Windows Defender scanning the
+    namespace across every installed google-* package, combined with
+    namespace-package resolution overhead). At module level that delay blew
+    past the MCP client's connection timeout, so the server never completed
+    its stdio handshake -- it looked "not registered" even though the code
+    was correct. Deferring the import here means the handshake completes
+    immediately; only the first actual tool call pays this cost.
+    """
+    global _google_imports_loaded
+    global AnalyticsAdminServiceClient, AccessBinding, KeyEvent
+    global BetaAnalyticsDataClient, DateRange, Dimension, Metric
+    global RunReportRequest, RunRealtimeReportRequest
+    global google_exceptions, service_account, _RETRYABLE_EXCEPTIONS
+
+    if _google_imports_loaded:
+        return
+    with _import_lock:
+        if _google_imports_loaded:
+            return
+
+        # v1alpha, not v1beta: AccessBinding management (create_access_binding,
+        # list_access_bindings) is only exposed on the v1alpha admin client as
+        # of google-analytics-admin 0.30.1 -- v1beta has KeyEvent support but
+        # no AccessBinding type or methods at all. v1alpha also has KeyEvent,
+        # so one client covers both instead of splitting across two versions.
+        from google.analytics.admin_v1alpha import AnalyticsAdminServiceClient
+        from google.analytics.admin_v1alpha.types import AccessBinding, KeyEvent
+        from google.analytics.data_v1beta import BetaAnalyticsDataClient
+        from google.analytics.data_v1beta.types import (
+            DateRange,
+            Dimension,
+            Metric,
+            RunReportRequest,
+            RunRealtimeReportRequest,
+        )
+        from google.api_core import exceptions as google_exceptions
+        from google.oauth2 import service_account
+
+        _RETRYABLE_EXCEPTIONS = (
+            google_exceptions.TooManyRequests,
+            google_exceptions.ResourceExhausted,
+            google_exceptions.ServiceUnavailable,
+            google_exceptions.DeadlineExceeded,
+            google_exceptions.InternalServerError,
+            google_exceptions.Aborted,
+        )
+        _google_imports_loaded = True
 
 
 def _get_client() -> BetaAnalyticsDataClient:
@@ -332,6 +377,7 @@ def _get_client() -> BetaAnalyticsDataClient:
     if _client is not None:
         return _client
 
+    _ensure_google_imports()
     with _client_lock:
         if _client is not None:
             return _client
@@ -347,10 +393,6 @@ def _get_client() -> BetaAnalyticsDataClient:
         )
         _client = BetaAnalyticsDataClient(credentials=creds)
         return _client
-
-
-_admin_client = None
-_admin_client_lock = threading.Lock()
 
 
 def _get_admin_client() -> AnalyticsAdminServiceClient:
@@ -377,6 +419,7 @@ def _get_admin_client() -> AnalyticsAdminServiceClient:
     if _admin_client is not None:
         return _admin_client
 
+    _ensure_google_imports()
     with _admin_client_lock:
         if _admin_client is not None:
             return _admin_client
@@ -605,6 +648,7 @@ def get_ga4_report(
     Raises:
         ValueError: If dimensions, metrics, limit, or property_id are invalid.
     """
+    _ensure_google_imports()
     dimension_names = _parse_api_names(dimensions, "dimensions")
     metric_names = _parse_api_names(metrics, "metrics")
     limit = _validate_limit(limit)
@@ -771,6 +815,7 @@ def get_realtime_users(
     Raises:
         ValueError: If limit or property_id are invalid.
     """
+    _ensure_google_imports()
     limit = _validate_limit(limit)
 
     client = _get_client()
@@ -886,6 +931,7 @@ def mark_key_event(event_name: str, property_id: Optional[str] = None) -> str:
         google.api_core.exceptions.GoogleAPIError: On permission or API
             errors other than AlreadyExists.
     """
+    _ensure_google_imports()
     if not event_name or not event_name.strip():
         raise ValueError("event_name is required.")
     event_name = event_name.strip()
@@ -954,6 +1000,7 @@ def grant_property_access(
         google.api_core.exceptions.GoogleAPIError: On permission or API
             errors.
     """
+    _ensure_google_imports()
     if not user_email or "@" not in user_email:
         raise ValueError(f"user_email must be a valid email address, got {user_email!r}.")
     if role not in _PREDEFINED_ROLES:
