@@ -752,7 +752,7 @@ def get_realtime_users(
     property_id: Optional[str] = None,
     limit: int = 10,
 ) -> str:
-    """Get realtime active users broken down by page path and country.
+    """Get realtime active users broken down by page/screen name and country.
 
     The breakdown is bounded by ``limit``, so its per-row activeUsers values do
     not necessarily sum to the property's true realtime total. The summed value
@@ -776,9 +776,12 @@ def get_realtime_users(
     client = _get_client()
     prop = _resolve_property(property_id)
 
+    # The Realtime Data API's supported dimension set is smaller than the
+    # standard Data API's -- "pagePath" is not valid here, "unifiedScreenName"
+    # (page title for web, screen name for apps) is the realtime equivalent.
     request = RunRealtimeReportRequest(
         property=prop,
-        dimensions=[Dimension(name="pagePath"), Dimension(name="country")],
+        dimensions=[Dimension(name="unifiedScreenName"), Dimension(name="country")],
         metrics=[Metric(name="activeUsers")],
         limit=limit,
     )
@@ -789,7 +792,7 @@ def get_realtime_users(
     rows = []
     for row in response.rows:
         rows.append({
-            "pagePath": row.dimension_values[0].value,
+            "unifiedScreenName": row.dimension_values[0].value,
             "country": row.dimension_values[1].value,
             "activeUsers": row.metric_values[0].value,
         })
